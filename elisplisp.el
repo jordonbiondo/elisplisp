@@ -55,12 +55,25 @@
     (ell:stack-set var value nil nil create)))
 
 (defun ell:stack-in ()
-  "Push a new stack frame."
+  "You probably want to be using `ell:with-new-frame'."
   (push ({ }) ell:stack))
 
 (defun ell:stack-out ()
-  "Pop out of the current stack frame."
+  "You probably want to be using `ell:with-new-frame'."
   (pop ell:stack))
+
+(defmacro ell:with-new-frame (&rest body)
+  "Run BODY down in a new stack frame, then pop out.
+Returns the result of the last expression in BODY."
+  (declare (indent defun))
+  (let ((err (make-symbol "err"))
+        (val (make-symbol "val")))
+    `(let ((,val (condition-case ,err
+                     (progn (ell:stack-in)
+                            ,@body)
+                   (error (ell:stack-out) (error (second ,err))))))
+       (ell:stack-out)
+       ,val)))
 
 (defun ell:stack-wall ()
   "Push a wall into the stack."
@@ -106,13 +119,6 @@ SCANNING is for internal use only."
 Is obj a ell error?"
   (and (consp obj) (equal (car obj) 'error)))
 
-(defun ell:docall (expr)
-  "evaluate an expression that is a funciton call in the form (func . args)."
-  (let ((sym-val (ell:eval (car expr)))) ;; get function from symbol
-    (if (functionp sym-val)
-        (apply sym-val (mapcar 'ell:eval (cdr expr))) ;; evaluate arg exprs and pass into function call
-      (error (format "Symbols has no value as a function: %s" (car expr))))))
-
 (defun ell:func-info (func)
   "Returns an alist with the 'args and 'body of FUNC"
   `((args . ,(second (if (and func (symbolp func)) (symbol-function func) func)))
@@ -127,35 +133,24 @@ Is obj a ell error?"
   (let ((func (ell:eval (car expr))))
     (if (ell:native-func-p func)
         (apply (cdr func) (mapcar 'ell:eval (cdr expr)))
-      (let ((info (ell:func-info func)))))))
-
-(defun ell:docall (expr)
-  (let ((func (ell:eval (car expr))))
-    (if (ell:native-func-p func)
-        (apply (cdr func) (mapcar 'ell:eval (cdr expr)))
       (let* ((info (ell:func-info func))
              (args (cdr (assoc 'args info)))
              (body (cdr (assoc 'body info))))
         (assert (= (length args) (length (cdr expr))) nil 
                 "incorrect number of args : FIX ME LATER")
-        (ell:stack-in)
-        (dolist (value (mapcar 'ell:eval (cdr expr)))
-          (ell:stack-set (pop args) value ell:stack nil t))
-        (let ((result (ell:eval (cons 'elldo body))))
-          (ell:stack-out)
-          result)))))
+        (ell:with-new-frame
+          (dolist (value (mapcar 'ell:eval (cdr expr)))
+            (ell:stack-set (pop args) value ell:stack nil t))
+          (ell:eval (cons 'elldo body)))))))
+        
 
 (defun ell:let (decs body)
   "Implemented let."
-  (ell:stack-in) ;; push a new stack frame
-  (dolist (dec decs) ;; bind the keys in decs to their evaluated values
-    (ell:set (car dec) (ell:eval (cadr dec)) t))
-  ;;(dump-frame 4)
-  (let ((retval (first (last (mapcar 'ell:eval body))))) ;; eval each body expr
-    (ell:stack-out) ;; pop stack frame
-    retval)) ;; return value of the last body call
-
-
+  (ell:with-new-frame
+    (dolist (dec decs) ;; bind the keys in decs to their evaluated values
+      (ell:set (car dec) (ell:eval (cadr dec)) t))
+    ;;(dump-frame 4)
+    (ell:eval (cons 'elldo body))))
 
 ;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Top level evaluations, currently, functions evaluation is handled
@@ -170,8 +165,11 @@ Is obj a ell error?"
 (defun ell:eval-lambda    (expr) (eval expr))
 (defun ell:eval-set       (expr) (ell:set (ell:eval (second expr)) (ell:eval (third expr))))
 (defun ell:eval-setq      (expr) (ell:set (second expr) (ell:eval (third expr))))
-(defun ell:eval-def       (expr) (ell:vars-set var value t create))
+(defun ell:eval-list      (expr) (apply 'list (mapcar 'ell:eval (cdr expr))))
+(defun ell:eval-def       (expr) (ell:eval-setq expr))
 (defun ell:eval-elldo     (expr) (first (last (mapcar 'ell:eval (cdr expr)))))
+(defun ell:eval-while     (expr) (while (ell:eval (second expr))
+                                   (ell:eval (cons 'elldo (cddr expr)))))
 (defun ell:eval-funcall   (expr) (ell:docall expr))
 (defun ell:eval-string    (expr) expr)
 (defun ell:eval-number    (expr) expr)
@@ -182,23 +180,27 @@ Is obj a ell error?"
       (cdr value))))
 
 (defun ell:eval (expr)
-  "This is terrible for now."
-  (cond
-   ((listp expr) (case (car expr)
-                   ;; special forms
-                   ('quote    (ell:eval-quote expr))
-                   ('let      (ell:eval-let expr))
-                   ('if       (ell:eval-if expr))
-                   ('lambda   (ell:eval-lambda expr))
-                   ('set      (ell:eval-set expr))
-                   ('setq     (ell:eval-setq expr))
-                   ('def      (ell:eval-def expr))
-                   ('elldo    (ell:eval-elldo expr))
-                   (otherwise (ell:eval-funcall expr))))
-   ((symbolp expr) (ell:eval-symbol expr))
-   ((stringp expr) (ell:eval-string expr))
-   ((numberp expr) (ell:eval-number expr))
-   (t (error "Don't know what to do with %S" expr))))
+  "This is terriblee for now."
+  (or (equal expr t)
+      (unless (and (listp expr) (equal (car expr) nil))
+        (cond
+         ((listp expr) (case (car expr)
+                         ;; special forms
+                         ('quote    (ell:eval-quote expr))
+                         ('let      (ell:eval-let expr))
+                         ('if       (ell:eval-if expr))
+                         ('lambda   (ell:eval-lambda expr))
+                         ('set      (ell:eval-set expr))
+                         ('setq     (ell:eval-setq expr))
+                         ('list     (ell:eval-list expr))
+                         ('def      (ell:eval-def expr))
+                         ('elldo    (ell:eval-elldo expr))
+                         ('while    (ell:eval-while expr))
+                         (otherwise (ell:eval-funcall expr))))
+         ((symbolp expr) (ell:eval-symbol expr))
+         ((stringp expr) (ell:eval-string expr))
+         ((numberp expr) (ell:eval-number expr))
+         (t (error "Don't know what to do with %S" expr))))))
 
 (defmacro ell (&rest body)
   (declare (indent defun))
@@ -207,8 +209,8 @@ Is obj a ell error?"
 ;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; "natively implemented functions" (emacs-lisp)
 ;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-(dolist (sym '(+ - / * mod % and or print car cdr cons format
-                 > < >= <=
+(dolist (sym '(+ - / * mod % and or print car cdr cons format not null
+                 = > < >= <=
                  first second third fourth fifth
                  sixth seventh eighth ninth tenth nth
                  caar caaar caaaar
@@ -218,6 +220,31 @@ Is obj a ell error?"
                  concat format append list))
   (>> ell:vars sym (cons 'native sym)))
 
+;; (ell
+;;   (let ((n 0))
+;;     (while (< n 4)
+;;       (setq n (- n 1))
+;;       (setq n (+ n 2))
+;;       (print n)
+;;       (print nil))))
 
-  (provide 'elisplisp)
+
+;; (ell
+  
+;;   (setq mapcar (lambda (fn data) (if (null data) nil (cons (fn (car data)) (mapcar fn (cdr data))))))
+  
+  
+;;   (let ((plus3 (lambda (x) (+ x 3))))
+;;     (print (mapcar plus3 (list 1 2 3)))
+;;     (let ((mapcar '(native . mapcar)))
+;;       (mapcar plus3 (list 4 5 6)))))
+
+
+
+
+
+
+
+
+(provide 'elisplisp)
 ;;; elisplisp.el ends here
